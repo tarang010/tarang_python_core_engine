@@ -31,6 +31,18 @@ EDGE_VOICE = os.getenv("TARANG_EDGE_VOICE", "en-IN-NeerjaNeural")
 # TEXT PROCESSING
 # ─────────────────────────────────────────────
 
+def get_voices():
+    return {
+        "status": "success",
+        "voices": [
+            {"id": "en-US-GuyNeural", "name": "Guy (US)"},
+            {"id": "en-US-JennyNeural", "name": "Jenny (US)"},
+            {"id": "en-IN-NeerjaNeural", "name": "Neerja (India)"},
+            {"id": "en-IN-PrabhatNeural", "name": "Prabhat (India)"},
+            {"id": "en-GB-RyanNeural", "name": "Ryan (UK)"},
+        ]
+    }
+
 def chunk_text(text, size):
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks, current = [], ""
