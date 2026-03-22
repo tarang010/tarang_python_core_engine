@@ -1,213 +1,175 @@
-# Tarang TTS Engine — Production Optimized Version
-
 import os
-import re
-import shutil
-import logging
 import asyncio
 import tempfile
+import logging
 from pathlib import Path
-from datetime import datetime
-
-# ffmpeg setup
-try:
-    import imageio_ffmpeg
-    from pydub import AudioSegment as _AS
-
-    _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    _AS.converter = _ffmpeg_path
-    os.environ["PATH"] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
-except Exception:
-    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("file2_tts")
 
-TTS_ENGINE = os.getenv("TARANG_TTS_ENGINE", "edge")
-CHUNK_SIZE = int(os.getenv("TARANG_TTS_CHUNK_SIZE", "500"))
-EDGE_VOICE = os.getenv("TARANG_EDGE_VOICE", "en-IN-NeerjaNeural")
+# ─────────────────────────────────────────────
+# Config (env-driven)
+# ─────────────────────────────────────────────
+DEFAULT_ENGINE = os.getenv("TARANG_TTS_ENGINE", "edge")
+DEFAULT_VOICE = os.getenv("TARANG_EDGE_VOICE", "en-IN-NeerjaNeural")
+CHUNK_SIZE = int(os.getenv("TARANG_TTS_CHUNK_SIZE", "800"))
 
 # ─────────────────────────────────────────────
-# TEXT PROCESSING
+# Voice API (frontend dependency)
 # ─────────────────────────────────────────────
-
 def get_voices():
     return {
         "status": "success",
         "voices": [
-            {"id": "en-US-GuyNeural", "name": "Guy (US)"},
-            {"id": "en-US-JennyNeural", "name": "Jenny (US)"},
-            {"id": "en-IN-NeerjaNeural", "name": "Neerja (India)"},
-            {"id": "en-IN-PrabhatNeural", "name": "Prabhat (India)"},
-            {"id": "en-GB-RyanNeural", "name": "Ryan (UK)"},
-        ]
+            {"id": "en-US-GuyNeural", "name": "Guy (US)", "gender": "male"},
+            {"id": "en-US-JennyNeural", "name": "Jenny (US)", "gender": "female"},
+            {"id": "en-US-AriaNeural", "name": "Aria (US)", "gender": "female"},
+            {"id": "en-US-DavisNeural", "name": "Davis (US)", "gender": "male"},
+            {"id": "en-GB-RyanNeural", "name": "Ryan (UK)", "gender": "male"},
+            {"id": "en-GB-SoniaNeural", "name": "Sonia (UK)", "gender": "female"},
+            {"id": "en-IN-NeerjaNeural", "name": "Neerja (India)", "gender": "female"},
+            {"id": "en-IN-PrabhatNeural", "name": "Prabhat (India)", "gender": "male"},
+        ],
+        "count": 8
     }
 
+# ─────────────────────────────────────────────
+# Utils
+# ─────────────────────────────────────────────
 def chunk_text(text, size):
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    chunks, current = [], ""
-    for s in sentences:
-        if len(current) + len(s) < size:
-            current += " " + s
-        else:
-            chunks.append(current.strip())
-            current = s
+    words = text.split()
+    chunks, current = [], []
+
+    for word in words:
+        current.append(word)
+        if len(" ".join(current)) > size:
+            chunks.append(" ".join(current))
+            current = []
+
     if current:
-        chunks.append(current.strip())
+        chunks.append(" ".join(current))
+
     return chunks
 
-
-# ─────────────────────────────────────────────
-# AUDIO UTILS
-# ─────────────────────────────────────────────
-
 def mp3_to_wav(mp3_path, wav_path):
-    from pydub import AudioSegment
-    audio = AudioSegment.from_mp3(str(mp3_path))
-    audio.export(str(wav_path), format="wav")
-    return True
-
-
-def merge_wav_files(files, output):
-    import numpy as np
-    from scipy.io import wavfile
-
-    data_all = []
-    rate = None
-
-    for f in files:
-        r, d = wavfile.read(str(f))
-        if rate is None:
-            rate = r
-        data_all.append(d)
-
-    merged = np.concatenate(data_all)
-    wavfile.write(str(output), rate, merged)
-    return True
-
+    try:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_mp3(mp3_path)
+        audio.export(wav_path, format="wav")
+        return True
+    except Exception as e:
+        logger.error(f"MP3→WAV failed: {e}")
+        return False
 
 # ─────────────────────────────────────────────
-# EDGE TTS (WITH RETRY + BACKOFF)
+# EDGE TTS (async)
 # ─────────────────────────────────────────────
-
-async def synthesize_chunk(edge_tts, text, idx, tmp_dir, voice):
+async def _edge_chunk(edge_tts, text, idx, tmp_dir, voice):
     mp3 = tmp_dir / f"{idx}.mp3"
     wav = tmp_dir / f"{idx}.wav"
 
-    retries = 3
-    delay = 1
+    try:
+        comm = edge_tts.Communicate(text, voice)
+        await comm.save(str(mp3))
 
-    for attempt in range(retries):
-        try:
-            com = edge_tts.Communicate(text, voice)
-            await com.save(str(mp3))
+        if not mp3.exists() or mp3.stat().st_size == 0:
+            return None
 
-            if mp3.exists() and mp3.stat().st_size > 0:
-                mp3_to_wav(mp3, wav)
-                mp3.unlink(missing_ok=True)
-                logger.info(f"Chunk {idx} ✓")
-                return wav
+        if mp3_to_wav(mp3, wav):
+            return wav
+        return None
+    except Exception as e:
+        logger.warning(f"Chunk {idx} failed: {e}")
+        return None
 
-        except Exception as e:
-            logger.warning(f"Chunk {idx} retry {attempt+1}: {e}")
-
-        await asyncio.sleep(delay)
-        delay *= 2  # exponential backoff
-
-    logger.error(f"Chunk {idx} FAILED after retries")
-    return None
-
-
-async def edge_async(chunks, tmp_dir, voice):
+async def _edge_async(chunks, tmp_dir, voice):
     import edge_tts
 
-    results = []
-    MAX_CONCURRENT = 3
+    tasks = [
+        _edge_chunk(edge_tts, chunk, i, tmp_dir, voice)
+        for i, chunk in enumerate(chunks)
+    ]
 
-    for i in range(0, len(chunks), MAX_CONCURRENT):
-        batch = chunks[i:i+MAX_CONCURRENT]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r is not None]
 
-        tasks = [
-            synthesize_chunk(edge_tts, txt, i+j, tmp_dir, voice)
-            for j, txt in enumerate(batch)
-        ]
+def _edge_sync(chunks, tmp_dir, voice):
+    import nest_asyncio
+    nest_asyncio.apply()
+    return asyncio.get_event_loop().run_until_complete(
+        _edge_async(chunks, tmp_dir, voice)
+    )
 
-        out = await asyncio.gather(*tasks)
-        results.extend(out)
+# ─────────────────────────────────────────────
+# WAV Merge
+# ─────────────────────────────────────────────
+def merge_wav(files, output):
+    import numpy as np
+    from scipy.io import wavfile
 
-        await asyncio.sleep(0.5)
+    data = []
+    sr = None
 
-    return [r for r in results if r]
+    for f in files:
+        rate, d = wavfile.read(f)
+        if sr is None:
+            sr = rate
+        data.append(d)
 
+    if not data:
+        return False
 
-def run_edge(chunks, tmp_dir, voice):
+    merged = np.concatenate(data)
+    wavfile.write(output, sr, merged)
+    return True
+
+# ─────────────────────────────────────────────
+# MAIN FUNCTION (COMPATIBLE FIXED)
+# ─────────────────────────────────────────────
+def generate_tts(
+    text: str = None,
+    engine: str = None,
+    voice_id: str = None,
+    output_dir=None,
+    **kwargs  # 🔥 absorbs old params safely
+):
     try:
-        return asyncio.run(edge_async(chunks, tmp_dir, voice))
-    except RuntimeError:
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as ex:
-            return ex.submit(asyncio.run, edge_async(chunks, tmp_dir, voice)).result()
+        if not text:
+            return {"status": "error", "error": "No text provided"}
 
+        engine = (engine or DEFAULT_ENGINE).lower()
+        voice = voice_id or DEFAULT_VOICE
 
-# ─────────────────────────────────────────────
-# FALLBACK: gTTS
-# ─────────────────────────────────────────────
+        logger.info(f"TTS start | engine={engine} | voice={voice}")
 
-def run_gtts(chunks, tmp_dir):
-    from gtts import gTTS
+        chunks = chunk_text(text, CHUNK_SIZE)
 
-    paths = []
-    for i, txt in enumerate(chunks):
-        mp3 = tmp_dir / f"{i}.mp3"
-        wav = tmp_dir / f"{i}.wav"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
 
-        try:
-            gTTS(txt).save(str(mp3))
-            mp3_to_wav(mp3, wav)
-            paths.append(wav)
-        except Exception as e:
-            logger.warning(f"gTTS failed chunk {i}: {e}")
+            if engine in ("edge", "edge-tts"):
+                chunk_files = _edge_sync(chunks, tmp_dir, voice)
+            else:
+                return {"status": "error", "error": f"Unsupported engine: {engine}"}
 
-    return paths
+            if not chunk_files:
+                return {"status": "error", "error": "TTS synthesis produced no audio output."}
 
+            output_dir = Path(output_dir or tmp_dir)
+            output_path = output_dir / "output.wav"
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+            if len(chunk_files) == 1:
+                output_path.write_bytes(chunk_files[0].read_bytes())
+            else:
+                if not merge_wav(chunk_files, output_path):
+                    return {"status": "error", "error": "Merge failed"}
 
-def generate_tts(text=None, output_dir=None):
-    if not text:
-        return {"status": "error", "error": "No text"}
+            return {
+                "status": "success",
+                "output_path": str(output_path),
+                "chunks": len(chunk_files)
+            }
 
-    chunks = chunk_text(text, CHUNK_SIZE)
-    logger.info(f"{len(chunks)} chunks created")
-
-    output_dir = Path(output_dir or tempfile.mkdtemp())
-    output_dir.mkdir(exist_ok=True)
-
-    final_wav = output_dir / "final.wav"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-
-        # TRY EDGE
-        paths = run_edge(chunks, tmp_dir, EDGE_VOICE)
-
-        # FALLBACK
-        if not paths:
-            logger.error("Edge failed → switching to gTTS")
-            paths = run_gtts(chunks, tmp_dir)
-
-        if not paths:
-            return {"status": "error", "error": "All TTS failed"}
-
-        if len(paths) == 1:
-            shutil.copy(paths[0], final_wav)
-        else:
-            merge_wav_files(paths, final_wav)
-
-    return {
-        "status": "success",
-        "output": str(final_wav),
-        "chunks": len(paths)
-    }
+    except Exception as e:
+        logger.error(f"TTS failed: {e}", exc_info=True)
+        return {"status": "error", "error": f"Internal server error: {str(e)}"}
