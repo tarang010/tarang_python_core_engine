@@ -12,6 +12,16 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 
+# ── Tell pydub where to find ffmpeg (imageio-ffmpeg provides it on Render) ────
+try:
+    import imageio_ffmpeg
+    _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    from pydub import AudioSegment as _AS
+    _AS.converter = _ffmpeg_path
+    os.environ["PATH"] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass  # system ffmpeg will be used if available
+
 try:
     from scipy.io import wavfile
     from scipy.signal import butter, filtfilt

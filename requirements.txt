@@ -7,6 +7,7 @@ python-docx
 scipy
 numpy
 pydub
+imageio-ffmpeg
 plotly
 openai
 edge-tts
