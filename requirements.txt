@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+pdfplumber
+python-docx
+scipy
+numpy
+pydub
+plotly
+openai
+edge-tts
+nest_asyncio
+python-dotenv

@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: tarang-python-bridge
+    runtime: python
+    buildCommand: apt-get install -y ffmpeg && pip install --break-system-packages -r requirements.txt
+    startCommand: uvicorn bridge:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TARANG_TTS_ENGINE
+        value: edge
+      - key: TARANG_MCQ_COUNT
+        value: "10"
+      - key: TARANG_TTS_CHUNK_SIZE
+        value: "800"
+      - key: TARANG_TTS_RATE
+        value: "180"
+      - key: TARANG_POOR_SCORE
+        value: "0.30"
+      - key: TARANG_S1_WINDOW_MIN
+        value: "10"
+      - key: TARANG_S1_S2_HOURS
+        value: "12.0"
+      - key: TARANG_S2_S3_HOURS
+        value: "24.0"
