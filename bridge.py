@@ -26,6 +26,10 @@ Fixes applied (v1.0.0.2):
   5. All endpoints pass session_state dicts to file5_mcq.py functions
   6. Verbose console logging on every step for Render log visibility
   7. CORS updated to allow Render backend + Firebase origins
+
+Fixes applied (v1.0.0.3):
+  8. Self-ping keep-alive — pings own /health every 10 minutes to prevent
+     Render free tier spin-down. Reads RENDER_EXTERNAL_URL env var.
 """
 
 import os
@@ -33,11 +37,13 @@ import sys
 import json
 import shutil
 import logging
+import asyncio
 import tempfile
 import base64
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -88,7 +94,7 @@ app = FastAPI(
         "FastAPI microservice exposing Tarang's Python core engine "
         "to the Express.js backend. Runs on localhost:5001."
     ),
-    version="1.0.0.2",
+    version="1.0.0.3",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -226,7 +232,7 @@ async def root():
     logger.info("GET / — root endpoint hit")
     return {
         "service": "Tarang Core Engine Bridge",
-        "version": "1.0.0.2",
+        "version": "1.0.0.3",
         "docs":    "/docs",
         "status":  "running",
     }
@@ -239,7 +245,7 @@ async def health():
     return {
         "status":  "ok",
         "service": "Tarang Python Bridge",
-        "version": "1.0.0.2",
+        "version": "1.0.0.3",
     }
 
 
@@ -543,8 +549,6 @@ async def analytics(req: AnalyticsRequest):
     if not req.session_state:
         return err("session_state is required.", 400)
 
-    # Convert string keys to int keys for all_questions / all_answer_keys
-    # (MongoDB returns string keys, file6_analytics expects int keys)
     def normalize_keys(d):
         if not d:
             return {}
@@ -833,7 +837,6 @@ async def pipeline_audio(
         return err(f"Pipeline audio failed: {str(e)}", 500)
 
     finally:
-        # Clean up all temp files using locals() — safe and reliable
         for var_name, p in [("tmp_path", tmp_path), ("txt_path", txt_path)]:
             try:
                 if p and os.path.exists(p):
@@ -841,7 +844,6 @@ async def pipeline_audio(
                     logger.info(f"  Cleaned up {var_name}: {p}")
             except Exception as e:
                 logger.warning(f"  Cleanup failed for {var_name}: {e}")
-        # mod_path (MP3) — keep if base64 encoding failed, otherwise clean
         if mod_path:
             try:
                 if os.path.exists(mod_path):
@@ -868,7 +870,6 @@ async def pipeline_mcq(req: PipelineMCQRequest):
 
     txt_path = None
     try:
-        # Write extracted text to temp file (initialise_document reads from file path)
         with tempfile.NamedTemporaryFile(
             delete=False, suffix=".txt", mode="w", encoding="utf-8"
         ) as tf:
@@ -894,20 +895,14 @@ async def pipeline_mcq(req: PipelineMCQRequest):
             f"| s3_qs={len(r5['session_3_questions'].get('questions',[]))}"
         )
 
-        # Return everything directly from initialise_document() return value
-        # NO disk reads — file5_mcq.py is fully stateless
         result = {
             "doc_id":             doc_id,
             "sessions_generated": r5["sessions_generated"],
-            "session_state":      r5["session_state"],        # full state for MongoDB
+            "session_state":      r5["session_state"],
             "sessions_meta":      r5["sessions_meta"],
-
-            # Questions (without correct_answers — safe for frontend)
             "session_1_questions": r5["session_1_questions"],
             "session_2_questions": r5["session_2_questions"],
             "session_3_questions": r5["session_3_questions"],
-
-            # Answer keys (with correct_answers — stored in MongoDB only)
             "session_1_answers":  r5["session_1_answers"],
             "session_2_answers":  r5["session_2_answers"],
             "session_3_answers":  r5["session_3_answers"],
@@ -945,15 +940,54 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ── Keep-alive: prevent Render free tier spin-down ────────────────────────────
+
+async def _keep_alive_loop():
+    """
+    Pings own /health endpoint every 10 minutes.
+    Render free tier spins down after 15 minutes of inactivity.
+    This loop keeps the pod warm indefinitely.
+    Reads RENDER_EXTERNAL_URL from env — set this in Render dashboard.
+    Falls back to localhost if env var is not set (safe for local dev).
+    """
+    self_url = os.getenv(
+        "RENDER_EXTERNAL_URL",
+        "http://localhost:5001"
+    ).rstrip("/")
+
+    ping_url     = f"{self_url}/health"
+    interval_sec = 10 * 60   # 10 minutes — well under the 15-min spin-down threshold
+
+    # Wait for full startup before first ping
+    await asyncio.sleep(30)
+    logger.info(f"[keep-alive] Started — pinging {ping_url} every {interval_sec // 60} minutes")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        while True:
+            try:
+                resp = await client.get(ping_url)
+                logger.info(f"[keep-alive] Ping OK — status={resp.status_code}")
+            except Exception as e:
+                # Non-fatal — log and keep looping
+                logger.warning(f"[keep-alive] Ping failed (non-fatal): {e}")
+            await asyncio.sleep(interval_sec)
+
+
 # ── Startup / shutdown events ─────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
-    logger.info("Tarang 1.0.0.2 — Python Bridge STARTING")
+    logger.info("Tarang 1.0.0.3 — Python Bridge STARTING")
     logger.info(f"  PROJECT_ROOT : {PROJECT_ROOT}")
     logger.info(f"  Python       : {sys.version.split()[0]}")
     logger.info(f"  Endpoints    : /pipeline/audio, /pipeline/mcq, /health, /docs")
+
+    # Launch keep-alive background task
+    self_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5001")
+    logger.info(f"  Keep-alive   : ENABLED — target={self_url}/health every 10 min")
+    asyncio.create_task(_keep_alive_loop())
+
     logger.info("=" * 60)
 
 
@@ -966,7 +1000,7 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    print("\nTarang 1.0.0.2 — Python Bridge")
+    print("\nTarang 1.0.0.3 — Python Bridge")
     print("================================")
     print("Starting FastAPI on http://localhost:5001")
     print("Swagger UI:  http://localhost:5001/docs")
