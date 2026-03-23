@@ -10,7 +10,6 @@ Responsibilities:
   - Accept JSON + multipart file uploads from Express backend
   - Call the appropriate core engine function
   - Return structured JSON responses
-  - Handle file storage paths consistently
   - Provide a health check endpoint for Express to ping on startup
 
 All endpoints return:
@@ -19,8 +18,14 @@ All endpoints return:
 Run with:
   uvicorn bridge:app --host 0.0.0.0 --port 5001 --reload
 
-Install dependencies:
-  pip install fastapi uvicorn python-multipart aiofiles
+Fixes applied (v1.0.0.2):
+  1. locals() used instead of dir() in finally blocks
+  2. /pipeline/mcq reads from initialise_document() return value — no disk reads
+  3. AnalyticsRequest includes session_state, all_questions, all_answer_keys
+  4. MCQ session models include session_state, questions_data, answer_key_data
+  5. All endpoints pass session_state dicts to file5_mcq.py functions
+  6. Verbose console logging on every step for Render log visibility
+  7. CORS updated to allow Render backend + Firebase origins
 """
 
 import os
@@ -28,6 +33,8 @@ import sys
 import json
 import shutil
 import logging
+import tempfile
+import base64
 from pathlib import Path
 from typing import Optional
 
@@ -36,11 +43,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 
-# ── Add project root to path so core engine files are importable ──────────────
+# ── Add project root to path ──────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Core engine imports ───────────────────────────────────────────────────────
+print("==> [bridge] Importing core engine modules...")
 from file1_extractor import extract
 from file2_tts       import generate_tts, get_voices
 from file3_modulator import modulate_audio
@@ -56,17 +64,22 @@ from file5_mcq       import (
 )
 from file6_analytics import generate_analytics
 from file7_captions  import generate_captions
+print("==> [bridge] All core engine modules imported OK")
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging — verbose for Render console visibility ───────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [bridge] %(levelname)s — %(message)s"
+    format="%(asctime)s [bridge] %(levelname)s — %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("bridge")
+logger.setLevel(logging.INFO)
 
-# ── Storage dirs ──────────────────────────────────────────────────────────────
-UPLOAD_DIR = PROJECT_ROOT / "storage" / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# Also set root logger so all module logs appear in Render console
+logging.getLogger().setLevel(logging.INFO)
+for mod in ["file1_extractor","file2_tts","file3_modulator",
+            "file4_visualizer","file5_mcq","file6_analytics","file7_captions"]:
+    logging.getLogger(mod).setLevel(logging.INFO)
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -75,21 +88,16 @@ app = FastAPI(
         "FastAPI microservice exposing Tarang's Python core engine "
         "to the Express.js backend. Runs on localhost:5001."
     ),
-    version="1.0.0.1",
+    version="1.0.0.2",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# ── CORS — allow Express backend on localhost:3000 / :5000 ───────────────────
+# ── CORS — allow all origins (Express + Firebase) ────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5000",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5000",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -99,63 +107,89 @@ app.add_middleware(
 
 class TTSRequest(BaseModel):
     extracted_txt_path: str
-    engine: Optional[str] = "pyttsx3"
-    output_filename: Optional[str] = None
-    voice_id: Optional[str] = None
+    engine:             Optional[str] = "edge"
+    output_filename:    Optional[str] = None
+    voice_id:           Optional[str] = None
 
 
 class ModulateRequest(BaseModel):
-    tts_wav_path: str
-    cognitive_state: Optional[str] = "deep_focus"
-    output_filename: Optional[str] = None
+    tts_wav_path:     str
+    cognitive_state:  Optional[str]   = "deep_focus"
+    output_filename:  Optional[str]   = None
     custom_beat_freq: Optional[float] = None
-    custom_depth: Optional[float] = None
+    custom_depth:     Optional[float] = None
 
 
 class VisualizeRequest(BaseModel):
     modulated_wav_path: str
-    role: Optional[str] = "user"
-    cognitive_state: Optional[str] = "deep_focus"
-    beat_freq_hz: Optional[float] = 14.0
-    document_title: Optional[str] = "Tarang Session"
-    session_number: Optional[int] = 1
-    output_stem: Optional[str] = None
+    role:               Optional[str]   = "user"
+    cognitive_state:    Optional[str]   = "deep_focus"
+    beat_freq_hz:       Optional[float] = 14.0
+    document_title:     Optional[str]   = "Tarang Session"
+    session_number:     Optional[int]   = 1
+    output_stem:        Optional[str]   = None
 
 
 class MCQInitRequest(BaseModel):
-    extracted_txt_path: str
-    document_title: Optional[str] = "Tarang Document"
-    num_questions: Optional[int] = 10
-    custom_s1_to_s2_hours: Optional[float] = 12.0
-    custom_s2_to_s3_hours: Optional[float] = 24.0
+    extracted_txt_path:     str
+    document_title:         Optional[str]   = "Tarang Document"
+    num_questions:          Optional[int]   = 10
+    custom_s1_to_s2_hours:  Optional[float] = 12.0
+    custom_s2_to_s3_hours:  Optional[float] = 24.0
 
+
+# ── MCQ session models — ALL include session_state ────────────────────────────
 
 class AudioCompletedRequest(BaseModel):
-    doc_id: str
-    role: Optional[str] = "user"
+    doc_id:        str
+    role:          Optional[str]  = "user"
+    session_state: Optional[dict] = None   # full state dict from MongoDB
 
 
 class GetQuestionsRequest(BaseModel):
-    doc_id: str
-    session: int
-    role: Optional[str] = "user"
+    doc_id:         str
+    session:        int
+    role:           Optional[str]  = "user"
+    session_state:  Optional[dict] = None  # full state dict from MongoDB
+    questions_data: Optional[dict] = None  # questions dict for this session
 
 
 class OverrideWindowRequest(BaseModel):
-    doc_id: str
+    doc_id:        str
+    session_state: Optional[dict] = None  # full state dict from MongoDB
 
 
 class SubmitTestRequest(BaseModel):
-    doc_id: str
-    session: int
-    user_answers: dict   # { "q001": ["A"], "q002": ["B", "C"] }
-    role: Optional[str] = "user"
+    doc_id:          str
+    session:         int
+    user_answers:    dict             # { "q001": ["A"], "q002": ["B","C"] }
+    role:            Optional[str]  = "user"
+    session_state:   Optional[dict] = None  # full state dict from MongoDB
+    answer_key_data: Optional[dict] = None  # answer key for this session
 
+
+class MCQStatusRequest(BaseModel):
+    doc_id:        str
+    role:          Optional[str]  = "user"
+    session_state: Optional[dict] = None  # full state dict from MongoDB
+
+
+class MCQResultsRequest(BaseModel):
+    doc_id:          str
+    role:            Optional[str]  = "user"
+    session_state:   Optional[dict] = None
+    all_answer_keys: Optional[dict] = None
+
+
+# ── Analytics request — includes all session data ────────────────────────────
 
 class AnalyticsRequest(BaseModel):
-    doc_id: str
-    role: Optional[str] = "user"
-    cognitive_states: Optional[dict] = None
+    doc_id:          str
+    role:            Optional[str]  = "user"
+    session_state:   Optional[dict] = None  # full state dict from MongoDB
+    all_questions:   Optional[dict] = None  # {1: questions_dict, 2: ..., 3: ...}
+    all_answer_keys: Optional[dict] = None  # {1: answers_dict, 2: ..., 3: ...}
+    cognitive_states:Optional[dict] = None
 
 
 class CaptionsRequest(BaseModel):
@@ -163,110 +197,114 @@ class CaptionsRequest(BaseModel):
     duration_sec: float
 
 
-# ── Response wrapper ──────────────────────────────────────────────────────────
+# ── Pipeline models ───────────────────────────────────────────────────────────
+
+class PipelineMCQRequest(BaseModel):
+    extracted_text: str
+    document_title: str = "Tarang Document"
+    doc_id:         str = ""
+
+
+# ── Response helpers ──────────────────────────────────────────────────────────
 
 def ok(data: dict) -> JSONResponse:
     return JSONResponse(content={"status": "success", "data": data})
 
 
 def err(message: str, code: int = 400) -> JSONResponse:
+    logger.error(f"Returning error response | code={code} | message={message}")
     return JSONResponse(
         status_code=code,
         content={"status": "error", "error": message}
     )
 
 
-# ── Health check ──────────────────────────────────────────────────────────────
+# ── System endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/", tags=["System"])
+async def root():
+    logger.info("GET / — root endpoint hit")
+    return {
+        "service": "Tarang Core Engine Bridge",
+        "version": "1.0.0.2",
+        "docs":    "/docs",
+        "status":  "running",
+    }
+
 
 @app.get("/health", tags=["System"])
 async def health():
     """Express backend pings this on startup to confirm bridge is alive."""
-    return {"status": "ok", "service": "Tarang Python Bridge", "version": "1.0.0.1"}
+    logger.info("GET /health — health check OK")
+    return {
+        "status":  "ok",
+        "service": "Tarang Python Bridge",
+        "version": "1.0.0.2",
+    }
 
 
 @app.get("/voices", tags=["Core Engine"])
 async def list_voices():
-    """
-    Returns all available pyttsx3 voices on this machine.
-    Called by the frontend upload page to populate the voice selector.
-    Only relevant when engine = pyttsx3.
-    """
+    """Returns available TTS voices. For edge-tts engine: curated English list."""
+    logger.info("GET /voices — listing voices")
     result = get_voices()
     if result["status"] != "success":
         return err(result.get("error", "Failed to list voices"))
+    logger.info(f"GET /voices — returning {result['count']} voices")
     return ok({"voices": result["voices"], "count": result["count"]})
-
-
-@app.get("/", tags=["System"])
-async def root():
-    return {
-        "service": "Tarang Core Engine Bridge",
-        "version": "1.0.0.1",
-        "docs":    "http://localhost:5001/docs",
-    }
 
 
 # ── FILE 1 — Document extraction ──────────────────────────────────────────────
 
 @app.post("/extract", tags=["Core Engine"])
 async def extract_document(file: UploadFile = File(...)):
-    """
-    Upload a document (PDF, DOCX, TXT, MD).
-    Extracts clean text and saves to storage/extracted/.
-    Returns extracted text path, word count, char count.
-    """
-    logger.info(f"Extract request | filename={file.filename}")
-
-    # Save upload to temp storage
-    suffix   = Path(file.filename).suffix.lower()
-    save_path = UPLOAD_DIR / file.filename
+    """Upload a document. Extracts clean text. Returns text, word count."""
+    logger.info(f"POST /extract | filename={file.filename}")
+    suffix    = Path(file.filename).suffix.lower()
+    tmp_path  = None
     try:
-        with open(save_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except Exception as e:
-        return err(f"Failed to save uploaded file: {e}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+        logger.info(f"  Saved upload to temp: {tmp_path}")
+        result = extract(filepath=tmp_path, save_output=False)
+        if result["status"] != "success":
+            return err(result.get("error", "Extraction failed"))
+        logger.info(f"  Extraction OK | words={result['word_count']}")
+        return ok({
+            "output_path": None,
+            "text":        result["text"],
+            "word_count":  result["word_count"],
+            "char_count":  result["char_count"],
+            "format":      result["format"],
+            "metadata":    result["metadata"],
+            "timestamp":   result["timestamp"],
+        })
+    finally:
+        if tmp_path:
+            try:
+                if os.path.exists(tmp_path): os.unlink(tmp_path)
+            except Exception as e:
+                logger.warning(f"  Temp cleanup failed: {e}")
 
-    # Call file1
-    result = extract(filepath=str(save_path), save_output=True)
 
-    if result["status"] != "success":
-        return err(result.get("error", "Extraction failed"))
-
-    logger.info(f"Extraction OK | words={result['word_count']} | path={result['output_path']}")
-    return ok({
-        "output_path":  result["output_path"],
-        "word_count":   result["word_count"],
-        "char_count":   result["char_count"],
-        "format":       result["format"],
-        "metadata":     result["metadata"],
-        "timestamp":    result["timestamp"],
-    })
-
-
-# ── FILE 2 — TTS generation ───────────────────────────────────────────────────
+# ── FILE 2 — TTS ──────────────────────────────────────────────────────────────
 
 @app.post("/tts", tags=["Core Engine"])
 async def generate_tts_audio(req: TTSRequest):
-    """
-    Generate TTS audio from an extracted .txt file.
-    Returns path to raw WAV file, duration, engine used.
-    """
-    logger.info(f"TTS request | path={req.extracted_txt_path} | engine={req.engine}")
-
+    """Generate TTS audio from extracted text file path."""
+    logger.info(f"POST /tts | path={req.extracted_txt_path} | engine={req.engine}")
     if not Path(req.extracted_txt_path).exists():
         return err(f"Text file not found: {req.extracted_txt_path}")
-
     result = generate_tts(
         source_txt_path=req.extracted_txt_path,
         engine=req.engine,
         output_filename=req.output_filename,
         voice_id=req.voice_id,
     )
-
     if result["status"] != "success":
         return err(result.get("error", "TTS generation failed"))
-
-    logger.info(f"TTS OK | engine={result['engine_used']} | duration={result['duration_sec']}s")
+    logger.info(f"  TTS OK | engine={result['engine_used']} | duration={result['duration_sec']}s")
     return ok({
         "output_path":  result["output_path"],
         "engine_used":  result["engine_used"],
@@ -277,19 +315,14 @@ async def generate_tts_audio(req: TTSRequest):
     })
 
 
-# ── FILE 3 — Binaural modulation ──────────────────────────────────────────────
+# ── FILE 3 — Modulation ───────────────────────────────────────────────────────
 
 @app.post("/modulate", tags=["Core Engine"])
 async def modulate(req: ModulateRequest):
-    """
-    Apply binaural AM modulation to a raw TTS WAV file.
-    Returns path to modulated stereo WAV.
-    """
-    logger.info(f"Modulate request | path={req.tts_wav_path} | state={req.cognitive_state}")
-
+    """Apply binaural AM modulation to TTS WAV file."""
+    logger.info(f"POST /modulate | path={req.tts_wav_path} | state={req.cognitive_state}")
     if not Path(req.tts_wav_path).exists():
         return err(f"WAV file not found: {req.tts_wav_path}")
-
     result = modulate_audio(
         input_wav_path=req.tts_wav_path,
         cognitive_state=req.cognitive_state,
@@ -297,11 +330,9 @@ async def modulate(req: ModulateRequest):
         custom_beat_freq=req.custom_beat_freq,
         custom_depth=req.custom_depth,
     )
-
     if result["status"] != "success":
         return err(result.get("error", "Modulation failed"))
-
-    logger.info(f"Modulate OK | beat={result['beat_freq_hz']}Hz | duration={result['duration_sec']}s")
+    logger.info(f"  Modulate OK | beat={result['beat_freq_hz']}Hz | duration={result['duration_sec']}s")
     return ok({
         "output_path":     result["output_path"],
         "cognitive_state": result["cognitive_state"],
@@ -318,17 +349,10 @@ async def modulate(req: ModulateRequest):
 
 @app.post("/visualize", tags=["Core Engine"])
 async def visualize(req: VisualizeRequest):
-    """
-    Generate audio visualization HTML.
-    Admin role → full frequency analysis report.
-    User role  → animated neon waveform.
-    Returns path to generated HTML file.
-    """
-    logger.info(f"Visualize request | role={req.role} | state={req.cognitive_state}")
-
+    """Generate audio visualization HTML."""
+    logger.info(f"POST /visualize | role={req.role} | state={req.cognitive_state}")
     if not Path(req.modulated_wav_path).exists():
-        return err(f"WAV file not found: {req.modulated_wav_path}")
-
+        return err(f"Audio file not found: {req.modulated_wav_path}")
     result = generate_visualization(
         modulated_wav_path=req.modulated_wav_path,
         role=req.role,
@@ -338,16 +362,15 @@ async def visualize(req: VisualizeRequest):
         session_number=req.session_number,
         output_stem=req.output_stem,
     )
-
     if result["status"] != "success":
         return err(result.get("error", "Visualization failed"))
-
-    logger.info(f"Visualize OK | type={result['report_type']} | path={result['output_path']}")
+    logger.info(f"  Visualize OK | type={result['report_type']}")
     return ok({
-        "output_path": result["output_path"],
-        "report_type": result["report_type"],
-        "role":        result["role"],
-        "timestamp":   result["timestamp"],
+        "output_path":  result["output_path"],
+        "html_content": result.get("html_content", ""),
+        "report_type":  result["report_type"],
+        "role":         result["role"],
+        "timestamp":    result["timestamp"],
     })
 
 
@@ -356,15 +379,12 @@ async def visualize(req: VisualizeRequest):
 @app.post("/mcq/init", tags=["MCQ"])
 async def mcq_init(req: MCQInitRequest):
     """
-    Initialise a document for MCQ sessions.
-    Generates all 3 question sets (Easy / Medium / Hard).
-    Returns document_id for all subsequent MCQ calls.
+    Initialise a document for MCQ. Generates all 3 question sets.
+    Returns session_state + all questions/answers as dicts.
     """
-    logger.info(f"MCQ init | path={req.extracted_txt_path} | title={req.document_title}")
-
+    logger.info(f"POST /mcq/init | path={req.extracted_txt_path} | title={req.document_title}")
     if not Path(req.extracted_txt_path).exists():
         return err(f"Text file not found: {req.extracted_txt_path}")
-
     result = initialise_document(
         source_txt_path=req.extracted_txt_path,
         document_title=req.document_title,
@@ -372,135 +392,210 @@ async def mcq_init(req: MCQInitRequest):
         custom_s1_to_s2_hours=req.custom_s1_to_s2_hours,
         custom_s2_to_s3_hours=req.custom_s2_to_s3_hours,
     )
-
     if result["status"] != "success":
         return err(result.get("error", "MCQ initialisation failed"))
-
-    logger.info(f"MCQ init OK | doc_id={result['document_id']}")
+    logger.info(f"  MCQ init OK | doc_id={result['document_id']}")
     return ok(result)
 
 
 @app.post("/mcq/audio-completed", tags=["MCQ"])
 async def mcq_audio_completed(req: AudioCompletedRequest):
     """
-    Mark audio as completed for a document.
-    Starts the 10-minute Session 1 window (bypassed for admin role).
+    Mark audio as completed. Starts the Session 1 window.
+    Requires session_state from MongoDB.
     """
-    logger.info(f"MCQ audio completed | doc_id={req.doc_id} | role={req.role}")
-    result = audio_completed(doc_id=req.doc_id, role=req.role)
+    logger.info(f"POST /mcq/audio-completed | doc_id={req.doc_id} | role={req.role}")
+    if not req.session_state:
+        logger.error("  Missing session_state in request body")
+        return err("session_state is required. Pass it from MongoDB.", 400)
+    result = audio_completed(
+        doc_id=req.doc_id,
+        role=req.role,
+        session_state=req.session_state,
+    )
     if result["status"] != "success":
         return err(result.get("error", "Failed to mark audio complete"))
+    logger.info(f"  Audio completed OK | doc_id={req.doc_id} | role={req.role}")
     return ok(result)
 
 
-@app.get("/mcq/status/{doc_id}", tags=["MCQ"])
-async def mcq_status(doc_id: str, role: str = "user"):
+@app.post("/mcq/status", tags=["MCQ"])
+async def mcq_status_post(req: MCQStatusRequest):
     """
-    Get full session status for a document.
-    Returns which sessions are available, locked, completed,
-    time remaining until next session unlocks, messages, etc.
+    Get full session status. Requires session_state from MongoDB.
+    POST version — accepts session_state in body.
     """
-    logger.info(f"MCQ status | doc_id={doc_id} | role={role}")
-    result = get_session_status(doc_id=doc_id, role=role)
+    logger.info(f"POST /mcq/status | doc_id={req.doc_id} | role={req.role}")
+    if not req.session_state:
+        logger.error("  Missing session_state in request body")
+        return err("session_state is required.", 400)
+    result = get_session_status(
+        doc_id=req.doc_id,
+        role=req.role,
+        session_state=req.session_state,
+    )
     if result["status"] != "success":
-        return err(result.get("error", "Failed to get status"), code=404)
+        return err(result.get("error", "Failed to get status"), 404)
+    logger.info(f"  MCQ status OK | doc_id={req.doc_id} | all_complete={result.get('all_sessions_complete')}")
     return ok(result)
 
 
 @app.post("/mcq/questions", tags=["MCQ"])
 async def mcq_questions(req: GetQuestionsRequest):
     """
-    Get questions for a specific session.
-    Enforces timing rules for normal users.
-    Admin role bypasses time gaps.
-    Returns error with can_override=True if Session 1 window expired.
+    Get questions for a session. Enforces timing rules.
+    Requires session_state + questions_data from MongoDB.
     """
-    logger.info(f"MCQ questions | doc_id={req.doc_id} | session={req.session} | role={req.role}")
-    result = get_questions(doc_id=req.doc_id, session=req.session, role=req.role)
+    logger.info(f"POST /mcq/questions | doc_id={req.doc_id} | session={req.session} | role={req.role}")
+    if not req.session_state:
+        return err("session_state is required.", 400)
+    if not req.questions_data:
+        return err("questions_data is required.", 400)
+    result = get_questions(
+        doc_id=req.doc_id,
+        session=req.session,
+        role=req.role,
+        session_state=req.session_state,
+        questions_data=req.questions_data,
+    )
     if result["status"] != "success":
-        # Pass through timing errors with full detail for frontend to handle
+        logger.warning(f"  MCQ questions blocked | reason={result.get('reason')} | doc_id={req.doc_id}")
         return JSONResponse(
             status_code=403,
             content={"status": "error", **{k: v for k, v in result.items() if k != "status"}}
         )
+    logger.info(f"  MCQ questions OK | session={req.session} | total={result.get('total')}")
     return ok(result)
 
 
 @app.post("/mcq/override", tags=["MCQ"])
 async def mcq_override(req: OverrideWindowRequest):
     """
-    Called when user clicks 'I have listened carefully and I am ready.'
-    Overrides the 10-minute Session 1 window.
+    Override the Session 1 time window.
+    Requires session_state from MongoDB.
     """
-    logger.info(f"MCQ override | doc_id={req.doc_id}")
-    result = override_window(doc_id=req.doc_id)
+    logger.info(f"POST /mcq/override | doc_id={req.doc_id}")
+    if not req.session_state:
+        return err("session_state is required.", 400)
+    result = override_window(doc_id=req.doc_id, session_state=req.session_state)
     if result["status"] != "success":
         return err(result.get("error", "Override failed"))
+    logger.info(f"  MCQ override OK | doc_id={req.doc_id}")
     return ok(result)
 
 
 @app.post("/mcq/submit", tags=["MCQ"])
 async def mcq_submit(req: SubmitTestRequest):
     """
-    Submit answers for a session.
-    Scores the test, updates session state.
-    Scores are hidden until all 3 sessions complete.
-    Returns re-listen recommendation if score < 30%.
-
-    user_answers format: { "q001": ["A"], "q002": ["B", "C"] }
+    Submit answers for a session. Returns score + updated state.
+    Requires session_state + answer_key_data from MongoDB.
     """
-    logger.info(f"MCQ submit | doc_id={req.doc_id} | session={req.session} | role={req.role}")
+    logger.info(f"POST /mcq/submit | doc_id={req.doc_id} | session={req.session} | role={req.role}")
+    if not req.session_state:
+        return err("session_state is required.", 400)
+    if not req.answer_key_data:
+        return err("answer_key_data is required.", 400)
     result = submit_test(
         doc_id=req.doc_id,
         session=req.session,
         user_answers=req.user_answers,
         role=req.role,
+        session_state=req.session_state,
+        answer_key_data=req.answer_key_data,
     )
     if result["status"] != "success":
         return err(result.get("error", "Submission failed"))
+    logger.info(f"  MCQ submit OK | session={req.session} | correct={result.get('correct_count')}/{result.get('total_questions')}")
     return ok(result)
 
 
-@app.get("/mcq/results/{doc_id}", tags=["MCQ"])
-async def mcq_results(doc_id: str, role: str = "user"):
+@app.post("/mcq/results", tags=["MCQ"])
+async def mcq_results_post(req: MCQResultsRequest):
     """
-    Get final results including all scores and unlocked correct answers.
-    Only available after all 3 sessions are complete.
+    Get final results after all 3 sessions complete.
+    Requires session_state from MongoDB.
     """
-    logger.info(f"MCQ results | doc_id={doc_id} | role={role}")
-    result = get_final_results(doc_id=doc_id, role=role)
+    logger.info(f"POST /mcq/results | doc_id={req.doc_id} | role={req.role}")
+    if not req.session_state:
+        return err("session_state is required.", 400)
+    result = get_final_results(
+        doc_id=req.doc_id,
+        role=req.role,
+        session_state=req.session_state,
+        all_answer_keys=req.all_answer_keys or {},
+    )
     if result["status"] != "success":
-        return err(result.get("error", "Results not available yet"), code=403)
+        return err(result.get("error", "Results not available yet"), 403)
+    logger.info(f"  MCQ results OK | doc_id={req.doc_id} | avg={result.get('average_score_display')}")
     return ok(result)
 
 
 # ── FILE 6 — Analytics ────────────────────────────────────────────────────────
 
+@app.post("/analytics", tags=["Analytics"])
+async def analytics(req: AnalyticsRequest):
+    """
+    Generate analytics for a completed document.
+    All 3 sessions must be complete.
+    Requires session_state, all_questions, all_answer_keys from MongoDB.
+    """
+    logger.info(f"POST /analytics | doc_id={req.doc_id} | role={req.role}")
+    if not req.session_state:
+        return err("session_state is required.", 400)
+
+    # Convert string keys to int keys for all_questions / all_answer_keys
+    # (MongoDB returns string keys, file6_analytics expects int keys)
+    def normalize_keys(d):
+        if not d:
+            return {}
+        result = {}
+        for k, v in d.items():
+            try:
+                result[int(k)] = v
+            except (ValueError, TypeError):
+                result[k] = v
+        return result
+
+    all_q  = normalize_keys(req.all_questions)
+    all_ak = normalize_keys(req.all_answer_keys)
+
+    logger.info(f"  Analytics | sessions_in_questions={list(all_q.keys())} | sessions_in_answers={list(all_ak.keys())}")
+
+    result = generate_analytics(
+        doc_id=req.doc_id,
+        role=req.role,
+        session_state=req.session_state,
+        all_questions=all_q,
+        all_answer_keys=all_ak,
+        cognitive_states=req.cognitive_states,
+    )
+    if result["status"] != "success":
+        return err(result.get("error", "Analytics generation failed"))
+
+    logger.info(f"  Analytics OK | doc_id={req.doc_id} | avg={result['analytics']['summary']['average_score_display']}")
+    return ok({
+        "analytics":    result["analytics"],
+        "html_content": result["html_content"],
+    })
+
+
+# ── FILE 7 — Captions ─────────────────────────────────────────────────────────
+
 @app.post("/captions", tags=["Captions"])
 async def captions(req: CaptionsRequest):
     """
-    Generate time-aligned captions from extracted text + audio duration.
-    Pure Python proportional timing — no AI, no extra dependencies.
-    Uses text already stored in MongoDB + duration from pipeline output.
-    Results cached in MongoDB after first call.
+    Generate time-aligned captions from text + audio duration.
+    Pure Python proportional timing — no AI needed.
     """
-    logger.info(f"Captions request | duration={req.duration_sec}s | words={len(req.text.split())}")
-
+    logger.info(f"POST /captions | duration={req.duration_sec}s | words={len(req.text.split())}")
     if not req.text or not req.text.strip():
         return err("No text provided.")
-
     if req.duration_sec <= 0:
         return err("Invalid audio duration.")
-
     result = generate_captions(text=req.text, duration_sec=req.duration_sec)
-
     if result["status"] != "success":
         return err(result.get("error", "Caption generation failed"))
-
-    logger.info(
-        f"Captions OK | segments={result['total_segments']} | "
-        f"duration={result['duration_sec']}s | method={result['method']}"
-    )
+    logger.info(f"  Captions OK | segments={result['total_segments']} | method={result['method']}")
     return ok({
         "captions":       result["captions"],
         "total_segments": result["total_segments"],
@@ -509,49 +604,18 @@ async def captions(req: CaptionsRequest):
     })
 
 
-@app.post("/analytics", tags=["Analytics"])
-async def analytics(req: AnalyticsRequest):
-    """
-    Generate analytics for a completed document.
-    All 3 sessions must be complete.
-    Returns JSON analytics + paths to JSON and HTML report files.
-    Admin role gets additional detail (question meta, timing config).
-    """
-    logger.info(f"Analytics request | doc_id={req.doc_id} | role={req.role}")
-    result = generate_analytics(
-        doc_id=req.doc_id,
-        role=req.role,
-        cognitive_states=req.cognitive_states,
-    )
-    if result["status"] != "success":
-        return err(result.get("error", "Analytics generation failed"))
-
-    logger.info(f"Analytics OK | doc_id={req.doc_id}")
-    return ok({
-        "analytics": result["analytics"],
-        "json_path": result["json_path"],
-        "html_path": result["html_path"],
-    })
-
-
 # ── Static file serving ───────────────────────────────────────────────────────
 
 @app.get("/files/{folder}/{filename}", tags=["Files"])
 async def serve_file(folder: str, filename: str):
-    """
-    Serve generated files (audio, reports, visualizations) to Express.
-    Express then streams them to the React frontend.
-
-    Accessible folders: audio_cache, reports, analytics, extracted
-    """
+    """Serve generated files to Express backend."""
+    logger.info(f"GET /files/{folder}/{filename}")
     allowed = {"audio_cache", "reports", "analytics", "extracted", "mcq"}
     if folder not in allowed:
         raise HTTPException(status_code=403, detail=f"Folder '{folder}' not accessible.")
-
     file_path = PROJECT_ROOT / "storage" / folder / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
-
     return FileResponse(
         path=str(file_path),
         filename=filename,
@@ -559,280 +623,353 @@ async def serve_file(folder: str, filename: str):
     )
 
 
-# ── Full pipeline endpoint ────────────────────────────────────────────────────
+# ── Pipeline: /pipeline/full (legacy) ────────────────────────────────────────
 
 @app.post("/pipeline/full", tags=["Pipeline"])
 async def full_pipeline(
-    file: UploadFile = File(...),
-    cognitive_state: str = Form("deep_focus"),
-    document_title:  str = Form("Tarang Document"),
-    tts_engine:      str = Form("pyttsx3"),
-    voice_id:        str = Form(""),
-    role:            str = Form("user"),
+    file:            UploadFile = File(...),
+    cognitive_state: str        = Form("deep_focus"),
+    document_title:  str        = Form("Tarang Document"),
+    tts_engine:      str        = Form("edge"),
+    voice_id:        str        = Form(""),
+    role:            str        = Form("user"),
 ):
     """
-    Single endpoint that runs the complete pipeline:
-      Upload doc → Extract → TTS → Modulate → Visualize → MCQ Init
-
-    Returns all output paths in one response.
-    Use this for the main document upload flow in the React frontend.
+    Legacy single-call pipeline: Extract → TTS → Modulate → Visualize → MCQ.
+    Kept for backward compatibility. New code should use /pipeline/audio + /pipeline/mcq.
     """
-    logger.info(
-        f"Full pipeline | file={file.filename} | state={cognitive_state} "
-        f"| title={document_title} | role={role}"
-    )
+    logger.info(f"POST /pipeline/full | file={file.filename} | state={cognitive_state} | engine={tts_engine} | role={role}")
 
-    # ── Step 1: Save upload ───────────────────────────────────────────────
-    save_path = UPLOAD_DIR / file.filename
+    tmp_path = txt_path = wav_path = None
+    suffix   = os.path.splitext(file.filename)[1]
     try:
-        with open(save_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except Exception as e:
-        return err(f"Upload failed: {e}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
 
-    # ── Step 2: Extract text ──────────────────────────────────────────────
-    r1 = extract(filepath=str(save_path), save_output=True)
-    if r1["status"] != "success":
-        return err(f"Extraction failed: {r1.get('error')}")
-    txt_path = r1["output_path"]
-    logger.info(f"Pipeline step 1 OK | words={r1['word_count']}")
-
-    # ── Step 3: TTS ───────────────────────────────────────────────────────
-    r2 = generate_tts(source_txt_path=txt_path, engine=tts_engine, voice_id=voice_id or None)
-    if r2["status"] != "success":
-        return err(f"TTS failed: {r2.get('error')}")
-    wav_path = r2["output_path"]
-    logger.info(f"Pipeline step 2 OK | duration={r2['duration_sec']}s")
-
-    # ── Step 4: Modulate ──────────────────────────────────────────────────
-    r3 = modulate_audio(input_wav_path=wav_path, cognitive_state=cognitive_state)
-    if r3["status"] != "success":
-        return err(f"Modulation failed: {r3.get('error')}")
-    mod_path = r3["output_path"]
-    logger.info(f"Pipeline step 3 OK | beat={r3['beat_freq_hz']}Hz")
-
-    # ── Step 5: Visualize ─────────────────────────────────────────────────
-    r4 = generate_visualization(
-        modulated_wav_path=mod_path,
-        role=role,
-        cognitive_state=cognitive_state,
-        beat_freq_hz=r3["beat_freq_hz"],
-        document_title=document_title,
-    )
-    if r4["status"] != "success":
-        return err(f"Visualization failed: {r4.get('error')}")
-    logger.info(f"Pipeline step 4 OK | viz={r4['report_type']}")
-
-    # ── Step 6: MCQ init ──────────────────────────────────────────────────
-    r5 = initialise_document(
-        source_txt_path=txt_path,
-        document_title=document_title,
-    )
-    if r5["status"] != "success":
-        return err(f"MCQ init failed: {r5.get('error')}")
-    doc_id = r5["document_id"]
-    logger.info(f"Pipeline step 5 OK | doc_id={doc_id}")
-
-    logger.info(f"Full pipeline complete | doc_id={doc_id}")
-
-    return ok({
-        "doc_id":           doc_id,
-        "document_title":   document_title,
-        "extracted_path":   txt_path,
-        "tts_wav_path":     wav_path,
-        "modulated_path":   mod_path,
-        "visualization_path": r4["output_path"],
-        "visualization_type": r4["report_type"],
-        "cognitive_state":  cognitive_state,
-        "beat_freq_hz":     r3["beat_freq_hz"],
-        "duration_sec":     r3["duration_sec"],
-        "word_count":       r1["word_count"],
-        "sessions_generated": r5["sessions_generated"],
-        "sessions_meta":    r5["sessions_meta"],
-        "message": (
-            "Pipeline complete. Call /mcq/audio-completed when the "
-            "user finishes listening to start the session flow."
-        ),
-    })
-
-
-# ── /pipeline/audio — Phase 1: Extract + TTS + Modulate + Captions ────────────
-# Returns mp3_b64, extracted_text, captions, beat_freq_hz, duration_sec
-# Does NOT run MCQ. MCQ fires separately via /pipeline/mcq when user hits Play.
-
-class PipelineAudioRequest(BaseModel):
-    cognitive_state: str  = "deep_focus"
-    document_title:  str  = "Tarang Document"
-    tts_engine:      str  = "edge"
-    voice_id:        str  = ""
-    role:            str  = "user"
-
-@app.post("/pipeline/audio", tags=["Pipeline"])
-async def pipeline_audio(
-    file: UploadFile = File(...),
-    cognitive_state: str = Form("deep_focus"),
-    document_title:  str = Form("Tarang Document"),
-    tts_engine:      str = Form("edge"),
-    voice_id:        str = Form(""),
-    role:            str = Form("user"),
-):
-    """
-    Phase 1 pipeline: Extract → TTS → Modulate → Captions.
-    Returns mp3 as base64, extracted text, and captions.
-    MCQ is NOT generated here — call /pipeline/mcq separately.
-    """
-    import base64, tempfile, os
-    logger.info(
-        f"Phase 1 pipeline | file={file.filename} | state={cognitive_state} "
-        f"| engine={tts_engine} | role={role}"
-    )
-
-    # Save upload to temp file
-    suffix = os.path.splitext(file.filename)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp_path = tmp.name
-        shutil.copyfileobj(file.file, tmp)
-
-    try:
-        # Step 1: Extract
+        logger.info(f"  Step 1: Extracting text from {file.filename}")
         r1 = extract(filepath=tmp_path, save_output=False)
         if r1["status"] != "success":
             return err(f"Extraction failed: {r1.get('error')}")
-        extracted_text = r1.get("text") or r1.get("extracted_text") or ""
-        word_count     = r1.get("word_count", 0)
-        logger.info(f"Phase1 step 1 OK | words={word_count}")
+        extracted_text = r1.get("text", "")
+        logger.info(f"  Step 1 OK | words={r1['word_count']}")
 
-        # Step 2: TTS — write text to temp file for TTS
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as tf:
             tf.write(extracted_text)
             txt_path = tf.name
 
+        logger.info(f"  Step 2: TTS | engine={tts_engine}")
         r2 = generate_tts(source_txt_path=txt_path, engine=tts_engine, voice_id=voice_id or None)
         if r2["status"] != "success":
             return err(f"TTS failed: {r2.get('error')}")
         wav_path = r2["output_path"]
-        logger.info(f"Phase1 step 2 OK | duration={r2['duration_sec']}s")
+        logger.info(f"  Step 2 OK | duration={r2['duration_sec']}s")
 
-        # Step 3: Modulate
+        logger.info(f"  Step 3: Modulate | state={cognitive_state}")
         r3 = modulate_audio(input_wav_path=wav_path, cognitive_state=cognitive_state)
         if r3["status"] != "success":
+            return err(f"Modulation failed: {r3.get('error')}")
+        mod_path = r3["output_path"]
+        logger.info(f"  Step 3 OK | beat={r3['beat_freq_hz']}Hz")
+
+        logger.info(f"  Step 4: Visualize | role={role}")
+        r4 = generate_visualization(
+            modulated_wav_path=mod_path,
+            role=role, cognitive_state=cognitive_state,
+            beat_freq_hz=r3["beat_freq_hz"], document_title=document_title,
+        )
+        if r4["status"] != "success":
+            return err(f"Visualization failed: {r4.get('error')}")
+        logger.info(f"  Step 4 OK | viz={r4['report_type']}")
+
+        logger.info(f"  Step 5: MCQ init | title={document_title}")
+        r5 = initialise_document(text=extracted_text, document_title=document_title)
+        if r5["status"] != "success":
+            return err(f"MCQ init failed: {r5.get('error')}")
+        doc_id = r5["document_id"]
+        logger.info(f"  Step 5 OK | doc_id={doc_id}")
+
+        logger.info(f"  /pipeline/full COMPLETE | doc_id={doc_id}")
+        return ok({
+            "doc_id":             doc_id,
+            "document_title":     document_title,
+            "extracted_text":     extracted_text,
+            "cognitive_state":    cognitive_state,
+            "beat_freq_hz":       r3["beat_freq_hz"],
+            "duration_sec":       r3["duration_sec"],
+            "word_count":         r1["word_count"],
+            "sessions_generated": r5["sessions_generated"],
+            "sessions_meta":      r5["sessions_meta"],
+            "session_state":      r5["session_state"],
+            "session_1_questions":r5["session_1_questions"],
+            "session_1_answers":  r5["session_1_answers"],
+            "session_2_questions":r5["session_2_questions"],
+            "session_2_answers":  r5["session_2_answers"],
+            "session_3_questions":r5["session_3_questions"],
+            "session_3_answers":  r5["session_3_answers"],
+        })
+    finally:
+        for p in [
+            tmp_path if 'tmp_path' in locals() else None,
+            txt_path if 'txt_path' in locals() else None,
+        ]:
+            try:
+                if p and os.path.exists(p): os.unlink(p)
+            except Exception as e:
+                logger.warning(f"  Temp cleanup failed: {e}")
+
+
+# ── Pipeline: /pipeline/audio (Phase 1) ──────────────────────────────────────
+
+@app.post("/pipeline/audio", tags=["Pipeline"])
+async def pipeline_audio(
+    file:            UploadFile = File(...),
+    cognitive_state: str        = Form("deep_focus"),
+    document_title:  str        = Form("Tarang Document"),
+    tts_engine:      str        = Form("edge"),
+    voice_id:        str        = Form(""),
+    role:            str        = Form("user"),
+):
+    """
+    Phase 1 pipeline: Extract → TTS → Modulate → Captions.
+    Returns MP3 as base64, extracted text, captions, duration.
+    MCQ is NOT generated here — call /pipeline/mcq separately when user hits Play.
+    """
+    logger.info(
+        f"POST /pipeline/audio | file={file.filename} | state={cognitive_state} "
+        f"| engine={tts_engine} | role={role}"
+    )
+
+    tmp_path = txt_path = wav_path = mod_path = None
+    suffix   = os.path.splitext(file.filename)[1]
+
+    try:
+        # ── Save upload ───────────────────────────────────────────────────
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+        logger.info(f"  Upload saved | tmp={tmp_path} | size={os.path.getsize(tmp_path)} bytes")
+
+        # ── Step 1: Extract ───────────────────────────────────────────────
+        logger.info(f"  Step 1: Extracting text...")
+        r1 = extract(filepath=tmp_path, save_output=False)
+        if r1["status"] != "success":
+            logger.error(f"  Step 1 FAILED: {r1.get('error')}")
+            return err(f"Extraction failed: {r1.get('error')}")
+        extracted_text = r1.get("text") or ""
+        word_count     = r1.get("word_count", 0)
+        logger.info(f"  Step 1 OK | words={word_count} | chars={r1.get('char_count',0)}")
+
+        if not extracted_text.strip():
+            return err("Document extraction produced empty text. Check if document is image-based.")
+
+        # ── Step 2: Write text to temp file for TTS ───────────────────────
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as tf:
+            tf.write(extracted_text)
+            txt_path = tf.name
+        logger.info(f"  Text written to: {txt_path}")
+
+        # ── Step 3: TTS ───────────────────────────────────────────────────
+        logger.info(f"  Step 2: TTS | engine={tts_engine} | voice={voice_id or 'default'}")
+        r2 = generate_tts(
+            source_txt_path=txt_path,
+            engine=tts_engine,
+            voice_id=voice_id or None,
+        )
+        if r2["status"] != "success":
+            logger.error(f"  Step 2 FAILED: {r2.get('error')}")
+            return err(f"TTS failed: {r2.get('error')}")
+        wav_path = r2["output_path"]
+        logger.info(f"  Step 2 OK | engine={r2['engine_used']} | duration={r2['duration_sec']}s | chunks={r2['chunks_total']}")
+
+        # ── Step 4: Modulate ──────────────────────────────────────────────
+        logger.info(f"  Step 3: Modulate | state={cognitive_state}")
+        r3 = modulate_audio(input_wav_path=wav_path, cognitive_state=cognitive_state)
+        if r3["status"] != "success":
+            logger.error(f"  Step 3 FAILED: {r3.get('error')}")
             return err(f"Modulation failed: {r3.get('error')}")
         mod_path     = r3["output_path"]
         beat_freq_hz = r3["beat_freq_hz"]
         duration_sec = r3["duration_sec"]
-        logger.info(f"Phase1 step 3 OK | beat={beat_freq_hz}Hz | duration={duration_sec}s")
+        logger.info(f"  Step 3 OK | beat={beat_freq_hz}Hz | duration={duration_sec}s | output={mod_path}")
 
-        # Step 4: Read MP3 and encode as base64
+        # ── Step 5: Read MP3 as base64 ────────────────────────────────────
+        logger.info(f"  Step 4: Encoding MP3 as base64...")
+        if not os.path.exists(mod_path):
+            return err(f"Modulated audio file not found at: {mod_path}")
+        mp3_size = os.path.getsize(mod_path)
         with open(mod_path, "rb") as mf:
             mp3_b64 = base64.b64encode(mf.read()).decode("utf-8")
+        logger.info(f"  Step 4 OK | mp3_size={mp3_size} bytes | b64_len={len(mp3_b64)} chars")
 
-        # Step 5: Captions (proportional timing — no AI needed)
-        from file7_captions import generate_captions
+        # ── Step 6: Generate captions ─────────────────────────────────────
+        logger.info(f"  Step 5: Generating captions | duration={duration_sec}s")
         cap_result = generate_captions(text=extracted_text, duration_sec=duration_sec)
-        captions   = cap_result.get("captions", []) if cap_result.get("status") == "success" else []
-        logger.info(f"Phase1 step 4 OK | captions={len(captions)}")
+        if cap_result.get("status") == "success":
+            captions = cap_result.get("captions", [])
+            logger.info(f"  Step 5 OK | segments={len(captions)} | method={cap_result.get('method')}")
+        else:
+            captions = []
+            logger.warning(f"  Step 5 WARNING: Caption generation failed: {cap_result.get('error')} — continuing without captions")
 
-        logger.info(f"Phase 1 complete | words={word_count} | duration={duration_sec}s")
+        logger.info(
+            f"  /pipeline/audio COMPLETE | words={word_count} | duration={duration_sec}s "
+            f"| captions={len(captions)} | b64_kb={len(mp3_b64)//1024}KB"
+        )
 
         return ok({
-            "mp3_b64":        mp3_b64,
-            "extracted_text": extracted_text,
-            "document_title": document_title,
-            "word_count":     word_count,
-            "duration_sec":   duration_sec,
-            "beat_freq_hz":   beat_freq_hz,
-            "cognitive_state":cognitive_state,
-            "captions":       captions,
+            "mp3_b64":         mp3_b64,
+            "extracted_text":  extracted_text,
+            "document_title":  document_title,
+            "word_count":      word_count,
+            "duration_sec":    duration_sec,
+            "beat_freq_hz":    beat_freq_hz,
+            "cognitive_state": cognitive_state,
+            "captions":        captions,
         })
 
+    except Exception as e:
+        logger.error(f"  /pipeline/audio EXCEPTION: {type(e).__name__}: {e}", exc_info=True)
+        return err(f"Pipeline audio failed: {str(e)}", 500)
+
     finally:
-        # Clean up temp files
-        for p in [tmp_path, txt_path if "txt_path" in dir() else None, wav_path if "wav_path" in dir() else None]:
+        # Clean up all temp files using locals() — safe and reliable
+        for var_name, p in [("tmp_path", tmp_path), ("txt_path", txt_path)]:
             try:
-                if p and os.path.exists(p): os.unlink(p)
-            except: pass
+                if p and os.path.exists(p):
+                    os.unlink(p)
+                    logger.info(f"  Cleaned up {var_name}: {p}")
+            except Exception as e:
+                logger.warning(f"  Cleanup failed for {var_name}: {e}")
+        # mod_path (MP3) — keep if base64 encoding failed, otherwise clean
+        if mod_path:
+            try:
+                if os.path.exists(mod_path):
+                    os.unlink(mod_path)
+                    logger.info(f"  Cleaned up mod_path: {mod_path}")
+            except Exception as e:
+                logger.warning(f"  Cleanup failed for mod_path: {e}")
 
 
-# ── /pipeline/mcq — Phase 2: MCQ Generation ──────────────────────────────────
-# Called in background when user clicks Play.
-# Takes extracted_text from MongoDB, generates 3 sessions of MCQs.
-
-class PipelineMCQRequest(BaseModel):
-    extracted_text: str
-    document_title: str = "Tarang Document"
-    doc_id:         str = ""
+# ── Pipeline: /pipeline/mcq (Phase 2) ────────────────────────────────────────
 
 @app.post("/pipeline/mcq", tags=["Pipeline"])
 async def pipeline_mcq(req: PipelineMCQRequest):
     """
     Phase 2 pipeline: Generate MCQ questions for all 3 sessions.
     Called in background when user clicks Play on the audio player.
+    Takes extracted_text from MongoDB — no file reads needed.
+    Returns all question/answer data as dicts for Express to store in MongoDB.
     """
-    import tempfile, os
-    logger.info(f"Phase 2 MCQ | doc_id={req.doc_id} | words={len(req.extracted_text.split())}")
+    logger.info(
+        f"POST /pipeline/mcq | doc_id={req.doc_id} "
+        f"| words={len(req.extracted_text.split())} | title={req.document_title}"
+    )
 
-    # Write extracted text to temp file for MCQ
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8") as tf:
-        tf.write(req.extracted_text)
-        txt_path = tf.name
-
+    txt_path = None
     try:
+        # Write extracted text to temp file (initialise_document reads from file path)
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".txt", mode="w", encoding="utf-8"
+        ) as tf:
+            tf.write(req.extracted_text)
+            txt_path = tf.name
+        logger.info(f"  Text written to temp: {txt_path} | size={os.path.getsize(txt_path)} bytes")
+
+        logger.info(f"  Calling initialise_document | title={req.document_title}")
         r5 = initialise_document(
             source_txt_path=txt_path,
             document_title=req.document_title,
         )
+
         if r5["status"] != "success":
+            logger.error(f"  MCQ init FAILED: {r5.get('error')}")
             return err(f"MCQ init failed: {r5.get('error')}")
 
         doc_id = r5["document_id"]
-        logger.info(f"Phase 2 MCQ complete | doc_id={doc_id} | sessions={r5['sessions_generated']}")
+        logger.info(
+            f"  MCQ init OK | doc_id={doc_id} | sessions={r5['sessions_generated']} "
+            f"| s1_qs={len(r5['session_1_questions'].get('questions',[]))} "
+            f"| s2_qs={len(r5['session_2_questions'].get('questions',[]))} "
+            f"| s3_qs={len(r5['session_3_questions'].get('questions',[]))}"
+        )
 
-        # Read generated question/answer files
-        import json
-        from pathlib import Path
+        # Return everything directly from initialise_document() return value
+        # NO disk reads — file5_mcq.py is fully stateless
+        result = {
+            "doc_id":             doc_id,
+            "sessions_generated": r5["sessions_generated"],
+            "session_state":      r5["session_state"],        # full state for MongoDB
+            "sessions_meta":      r5["sessions_meta"],
 
-        mcq_dir = Path("storage/mcq") if Path("storage/mcq").exists() else Path(tempfile.gettempdir())
-        result  = {
-            "doc_id":            doc_id,
-            "sessions_generated":r5["sessions_generated"],
-            "session_state":     r5.get("sessions_meta", {}),
+            # Questions (without correct_answers — safe for frontend)
+            "session_1_questions": r5["session_1_questions"],
+            "session_2_questions": r5["session_2_questions"],
+            "session_3_questions": r5["session_3_questions"],
+
+            # Answer keys (with correct_answers — stored in MongoDB only)
+            "session_1_answers":  r5["session_1_answers"],
+            "session_2_answers":  r5["session_2_answers"],
+            "session_3_answers":  r5["session_3_answers"],
         }
 
-        for n in [1, 2, 3]:
-            q_path = Path(f"storage/mcq/{doc_id}_session{n}_questions.json")
-            a_path = Path(f"storage/mcq/{doc_id}_session{n}_answers.json")
-            result[f"session_{n}_questions"] = json.loads(q_path.read_text()) if q_path.exists() else {"questions": []}
-            result[f"session_{n}_answers"]   = json.loads(a_path.read_text()) if a_path.exists() else {"answers": {}}
-
+        logger.info(f"  /pipeline/mcq COMPLETE | doc_id={doc_id}")
         return ok(result)
 
+    except Exception as e:
+        logger.error(f"  /pipeline/mcq EXCEPTION: {type(e).__name__}: {e}", exc_info=True)
+        return err(f"MCQ pipeline failed: {str(e)}", 500)
+
     finally:
-        try:
-            if os.path.exists(txt_path): os.unlink(txt_path)
-        except: pass
+        if txt_path:
+            try:
+                if os.path.exists(txt_path):
+                    os.unlink(txt_path)
+                    logger.info(f"  Cleaned up txt_path: {txt_path}")
+            except Exception as e:
+                logger.warning(f"  Cleanup failed: {e}")
 
 
-
-# ── Exception handler ─────────────────────────────────────────────────────────
+# ── Global exception handler ──────────────────────────────────────────────────
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error(
+        f"UNHANDLED EXCEPTION | {request.method} {request.url.path} | "
+        f"{type(exc).__name__}: {exc}",
+        exc_info=True
+    )
     return JSONResponse(
         status_code=500,
         content={"status": "error", "error": f"Internal server error: {str(exc)}"}
     )
 
 
+# ── Startup / shutdown events ─────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("=" * 60)
+    logger.info("Tarang 1.0.0.2 — Python Bridge STARTING")
+    logger.info(f"  PROJECT_ROOT : {PROJECT_ROOT}")
+    logger.info(f"  Python       : {sys.version.split()[0]}")
+    logger.info(f"  Endpoints    : /pipeline/audio, /pipeline/mcq, /health, /docs")
+    logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Tarang Python Bridge — shutting down")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    print("\nTarang 1.0.0.1 — Python Bridge")
+    print("\nTarang 1.0.0.2 — Python Bridge")
     print("================================")
     print("Starting FastAPI on http://localhost:5001")
     print("Swagger UI:  http://localhost:5001/docs")
-    print("ReDoc:       http://localhost:5001/redoc")
     print()
     uvicorn.run(
         "bridge:app",
