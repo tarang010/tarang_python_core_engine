@@ -169,6 +169,8 @@ def merge_audio_chunks(audio_paths: list, output_wav_path: Path) -> bool:
                 # ffmpeg concat requires forward slashes and escaped paths
                 # f.write(f"file '{str(p)}'
                 f.write("file '" + str(p) + "'\n")
+
+                
         logger.info(f"  ffmpeg concat list: {list_path} | {len(audio_paths)} files")
 
         cmd = [
