@@ -20,16 +20,17 @@ import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 
-# ── ffmpeg via imageio-ffmpeg ─────────────────────────────────────────────────
+# ── ffmpeg via imageio-ffmpeg — add to PATH for subprocess calls ──────────────
 try:
     import imageio_ffmpeg
     _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     os.environ["PATH"] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
-    from pydub import AudioSegment as _AS
-    _AS.converter = _ffmpeg_path
     print(f"==> [file2_tts] ffmpeg OK: {_ffmpeg_path}")
 except Exception as e:
-    print(f"==> [file2_tts] imageio-ffmpeg unavailable ({e}) — using system ffmpeg")
+    print(f"==> [file2_tts] imageio-ffmpeg unavailable ({e}) — will use system ffmpeg")
+# NOTE: pydub is intentionally NOT imported at module level.
+# pydub 0.25.1 crashes on Python 3.13+ (imports pyaudioop which was removed).
+# All audio operations use ffmpeg subprocess directly instead.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -133,31 +134,82 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> list:
     return [c for c in chunks if c.strip()]
 
 
-# ── Audio merger using pydub only (no pyaudioop, no scipy) ───────────────────
+# ── Audio merger using ffmpeg subprocess (zero Python audio lib deps) ─────────
+
+def _get_ffmpeg() -> str:
+    """Get ffmpeg binary path — imageio-ffmpeg first, then system ffmpeg."""
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        logger.info(f"  ffmpeg from imageio-ffmpeg: {path}")
+        return path
+    except Exception:
+        logger.info("  Using system ffmpeg")
+        return "ffmpeg"
+
 
 def merge_audio_chunks(audio_paths: list, output_wav_path: Path) -> bool:
     """
-    Merge MP3 or WAV chunks into a single WAV file.
-    Uses pydub + ffmpeg ONLY — does NOT use pyaudioop or scipy.
-    Works on Python 3.12, 3.13, 3.14+.
-    """
-    try:
-        from pydub import AudioSegment
-        logger.info(f"  Merging {len(audio_paths)} audio chunks via pydub...")
-        combined = AudioSegment.empty()
-        for i, path in enumerate(audio_paths):
-            ext = path.suffix.lower().lstrip(".")
-            seg = AudioSegment.from_file(str(path), format=ext)
-            combined += seg
-            logger.info(f"  Added chunk {i+1}/{len(audio_paths)} | {path.name} | {len(seg)}ms")
+    Merge MP3 chunks into a single WAV file using ffmpeg subprocess.
+    Does NOT import pydub, audioop, pyaudioop, or scipy.
+    Works on any Python version including 3.14+.
 
-        # Normalize to mono WAV at target sample rate for file3_modulator
-        combined = combined.set_frame_rate(SAMPLE_RATE).set_channels(1)
-        combined.export(str(output_wav_path), format="wav")
+    Strategy:
+      1. Write an ffmpeg concat list file
+      2. Run: ffmpeg -f concat -safe 0 -i list.txt -ar 22050 -ac 1 output.wav
+    """
+    import subprocess
+    ffmpeg = _get_ffmpeg()
+
+    try:
+        # Write concat list file
+        list_path = output_wav_path.parent / "concat_list.txt"
+        with open(list_path, "w") as f:
+            for p in audio_paths:
+                # ffmpeg concat requires forward slashes and escaped paths
+                f.write(f"file '{str(p)}'
+")
+        logger.info(f"  ffmpeg concat list: {list_path} | {len(audio_paths)} files")
+
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(list_path),
+            "-ar", str(SAMPLE_RATE),
+            "-ac", "1",
+            "-vn",
+            str(output_wav_path),
+        ]
+        logger.info(f"  Running: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        # Clean up list file
+        try:
+            list_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if result.returncode != 0:
+            logger.error(f"  ffmpeg failed (code {result.returncode}):")
+            logger.error(f"  stderr: {result.stderr[-500:]}")
+            return False
+
         size_kb = output_wav_path.stat().st_size // 1024
-        duration_s = len(combined) / 1000.0
-        logger.info(f"  Merge OK → {output_wav_path.name} | {size_kb}KB | {duration_s:.1f}s")
+        logger.info(f"  Merge OK → {output_wav_path.name} | {size_kb}KB")
         return True
+
+    except subprocess.TimeoutExpired:
+        logger.error("  ffmpeg merge timed out after 120s")
+        return False
+    except FileNotFoundError:
+        logger.error(f"  ffmpeg not found at: {ffmpeg}")
+        return False
     except Exception as e:
         logger.error(f"  Merge FAILED: {type(e).__name__}: {e}", exc_info=True)
         return False
@@ -176,8 +228,8 @@ async def _synthesize_one_chunk_async(
     """
     Synthesize one text chunk via edge-tts.
     Returns (idx, mp3_path) — MP3 directly, NO WAV conversion here.
-    WAV conversion is done in bulk by merge_audio_chunks() using pydub.
-    This avoids any pyaudioop dependency entirely.
+    WAV conversion is done in bulk by merge_audio_chunks() using ffmpeg subprocess.
+    No pydub import needed — ffmpeg handles everything.
     """
     mp3_path = tmp_dir / f"chunk_{idx:04d}.mp3"
     try:
@@ -382,7 +434,7 @@ def generate_tts(
     """
     Generate TTS audio from text string or text file path.
     Returns WAV file path for file3_modulator to process.
-    Uses pydub + ffmpeg for all audio operations — no pyaudioop needed.
+    Uses ffmpeg subprocess for all audio operations — no pydub/pyaudioop needed.
     """
     active_engine = (engine or TTS_ENGINE).lower().strip()
     logger.info(f"generate_tts START | engine={active_engine} | voice={voice_id or 'default'}")
@@ -451,20 +503,9 @@ def generate_tts(
             return {"status": "error", "error": "TTS synthesis produced no audio output."}
 
         logger.info(f"  Merging {len(chunk_paths)} chunks → {output_path.name}")
-        if len(chunk_paths) == 1:
-            # Single chunk — just convert directly to WAV
-            try:
-                from pydub import AudioSegment
-                ext = chunk_paths[0].suffix.lower().lstrip(".")
-                seg = AudioSegment.from_file(str(chunk_paths[0]), format=ext)
-                seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(1)
-                seg.export(str(output_path), format="wav")
-                logger.info(f"  Single chunk → WAV | {output_path.stat().st_size//1024}KB")
-            except Exception as e:
-                return {"status": "error", "error": f"Audio conversion failed: {e}"}
-        else:
-            if not merge_audio_chunks(chunk_paths, output_path):
-                return {"status": "error", "error": "Failed to merge audio chunks."}
+        # merge_audio_chunks handles both single and multiple chunks via ffmpeg
+        if not merge_audio_chunks(chunk_paths, output_path):
+            return {"status": "error", "error": "Failed to merge audio chunks."}
 
     # ── Duration ──────────────────────────────────────────────────────────────
     duration_sec = 0.0
