@@ -1,9 +1,10 @@
 services:
   - type: web
-    name: tarang-python-bridge
+    name: tarang-python-core-engine
     runtime: python
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn bridge:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn bridge:app --host 0.0.0.0 --port $PORT --loop asyncio
     envVars:
       - key: OPENAI_API_KEY
         sync: false
