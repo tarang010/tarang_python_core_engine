@@ -7,20 +7,12 @@ No sidecar JSON files written.
 """
 
 import os
+import shutil
 import logging
+import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-
-# ── Tell pydub where to find ffmpeg (imageio-ffmpeg provides it on Render) ────
-try:
-    import imageio_ffmpeg
-    _ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    from pydub import AudioSegment as _AS
-    _AS.converter = _ffmpeg_path
-    os.environ["PATH"] = os.path.dirname(_ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
-except Exception:
-    pass  # system ffmpeg will be used if available
 
 try:
     from scipy.io import wavfile
@@ -45,7 +37,74 @@ COGNITIVE_PRESETS = {
 DEFAULT_STATE = os.getenv("TARANG_COGNITIVE_STATE", "deep_focus")
 
 
-# ── Audio helpers ─────────────────────────────────────────────────────────────
+# ── ffmpeg resolver (same strategy as file2_tts.py) ──────────────────────────
+
+def _get_ffmpeg() -> str:
+    """
+    Resolve ffmpeg binary path.
+    Priority: imageio-ffmpeg (bundled) → system PATH.
+    Never touches pydub. Works on Python 3.14+.
+    """
+    try:
+        import imageio_ffmpeg
+        path = imageio_ffmpeg.get_ffmpeg_exe()
+        logger.info(f"ffmpeg via imageio-ffmpeg: {path}")
+        return path
+    except Exception:
+        pass
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        logger.info(f"ffmpeg via system PATH: {system_ffmpeg}")
+        return system_ffmpeg
+
+    raise RuntimeError(
+        "ffmpeg not found. Install imageio-ffmpeg (pip install imageio-ffmpeg) "
+        "or ensure ffmpeg is on PATH."
+    )
+
+
+def _wav_to_mp3_ffmpeg(wav_path: Path, mp3_path: Path, bitrate: str = "192k") -> Path:
+    """
+    Convert WAV → stereo MP3 using ffmpeg subprocess.
+    No pydub. No AudioSegment. Streams directly from disk — safe for large files.
+    Returns mp3_path on success, raises on failure.
+    """
+    ffmpeg_bin = _get_ffmpeg()
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",                        # overwrite output if exists
+        "-i", str(wav_path),         # input
+        "-vn",                       # no video
+        "-ar", "44100",              # sample rate
+        "-ac", "2",                  # stereo (required for binaural)
+        "-b:a", bitrate,             # bitrate
+        "-f", "mp3",                 # format
+        str(mp3_path),
+    ]
+
+    logger.info(f"ffmpeg converting {wav_path.name} → {mp3_path.name} @ {bitrate}")
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=300,                 # 5-minute hard cap — large files are fine, hangs are not
+    )
+
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg exited {result.returncode}: {err[-500:]}")
+
+    if not mp3_path.exists() or mp3_path.stat().st_size == 0:
+        raise RuntimeError(f"ffmpeg ran but output file is missing or empty: {mp3_path}")
+
+    logger.info(f"MP3 conversion complete — {mp3_path.name} ({mp3_path.stat().st_size // 1024} KB)")
+    return mp3_path
+
+
+# ── Audio helpers (unchanged) ─────────────────────────────────────────────────
 
 def load_wav(filepath: Path) -> tuple:
     sample_rate, data = wavfile.read(str(filepath))
@@ -121,7 +180,7 @@ def modulate_audio(
     output_filename: str = None,
     custom_beat_freq: float = None,
     custom_depth: float = None,
-    output_dir: Path = None,  # bridge passes its TemporaryDirectory path here
+    output_dir: Path = None,
 ) -> dict:
     """
     STATELESS: Reads WAV from temp path, writes MP3 to same temp dir.
@@ -166,7 +225,6 @@ def modulate_audio(
 
     left, right = add_fade(left, right, sample_rate, fade_in_sec=2.0, fade_out_sec=3.0)
 
-    # Use same temp dir as input WAV (bridge's TemporaryDirectory)
     if output_dir is None:
         output_dir = input_wav_path.parent
     output_dir = Path(output_dir)
@@ -179,34 +237,33 @@ def modulate_audio(
     except Exception as e:
         return {"status": "error", "error": f"Failed to save modulated WAV: {e}"}
 
-    # ── Convert WAV → MP3, then delete WAV ───────────────────────────────
+    # ── Convert WAV → MP3 via ffmpeg subprocess (no pydub) ───────────────
     mp3_path = wav_path.with_suffix(".mp3")
+    output_path: Path
+
     try:
-        from pydub import AudioSegment
-        audio_seg = AudioSegment.from_wav(str(wav_path))
-        audio_seg.export(
-            str(mp3_path), format="mp3", bitrate="192k",
-            parameters=["-ac", "2"]   # keep stereo for binaural
-        )
-        logger.info(f"MP3 conversion complete — {mp3_path.name} ({mp3_path.stat().st_size // 1024} KB)")
-        wav_path.unlink(missing_ok=True)   # delete WAV — not needed anymore
+        _wav_to_mp3_ffmpeg(wav_path, mp3_path, bitrate="192k")
+        wav_path.unlink(missing_ok=True)   # WAV no longer needed
         output_path = mp3_path
     except Exception as e:
-        logger.warning(f"MP3 conversion failed ({e}) — keeping WAV")
-        output_path = wav_path
+        logger.warning(f"ffmpeg MP3 conversion failed ({e}) — keeping WAV as fallback")
+        output_path = wav_path             # bridge will upload WAV instead
 
-    # Also delete the input TTS raw WAV since it's no longer needed
+    # Delete the input TTS raw WAV
     try:
         input_wav_path.unlink(missing_ok=True)
     except Exception:
         pass
 
     duration_sec = round(len(left) / sample_rate, 2)
-    logger.info(f"Modulation complete — state: {state_key} | beat: {preset['beat_freq']} Hz | duration: {duration_sec}s | output: {output_path.name}")
+    logger.info(
+        f"Modulation complete — state: {state_key} | beat: {preset['beat_freq']} Hz "
+        f"| duration: {duration_sec}s | output: {output_path.name}"
+    )
 
     return {
         "status":          "success",
-        "output_path":     str(output_path),   # temp path — bridge uploads to Cloudinary then deletes
+        "output_path":     str(output_path),
         "cognitive_state": state_key,
         "beat_freq_hz":    preset["beat_freq"],
         "carrier_freq_hz": preset["carrier"],
