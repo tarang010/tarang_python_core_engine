@@ -1361,7 +1361,7 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("BRIDGE_PORT", "9801"))
+    port = int(os.getenv("PORT", "9801"))
     print(f"\nTarang 2.0.1 — Python Bridge (Production)")
     print(f"=========================================")
     print(f"http://localhost:{port} | Swagger: /docs")
