@@ -1,0 +1,20 @@
+{
+  "dependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.4.27",
+    "axios": "^1.14.0",
+    "firebase": "^12.11.0",
+    "framer-motion": "^12.38.0",
+    "html2canvas": "^1.4.1",
+    "nodemailer": "^8.0.3",
+    "postcss": "^8.5.8",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.2",
+    "recharts": "^3.8.1",
+    "tailwindcss": "^4.2.2",
+    "vite": "^8.0.3"
+  }
+}

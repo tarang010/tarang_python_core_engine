@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.zip
+mern/
+About_SQL.pdf
+node_modules/
+package.json/
+package-lock.json
